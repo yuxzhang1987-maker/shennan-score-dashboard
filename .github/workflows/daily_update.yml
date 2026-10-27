@@ -1,9 +1,8 @@
-
 name: Daily Shennan Score Update
 on:
   workflow_dispatch:
   schedule:
-    # 17:30 Taiwan/China time on weekdays
+    # 17:30 Taiwan/China time on weekdays (UTC 09:30)
     - cron: "30 9 * * 1-5"
 permissions:
   contents: write
@@ -15,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install yfinance pandas numpy
+      - run: pip install -r requirements.txt
       - run: python update_data.py
       - name: Commit history
         run: |
