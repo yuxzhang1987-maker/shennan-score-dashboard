@@ -9,6 +9,7 @@ st.set_page_config(page_title="深南电路智能监控评分", page_icon="📈"
 BASE = Path(__file__).parent
 DATA = BASE / "data" / "history.csv"
 HOURLY = BASE / "data" / "hourly_history.csv"
+ALERT_HISTORY = BASE / "data" / "alert_history.csv"
 
 st.title("📈 深南电路智能监控评分")
 st.caption("五维评分｜逐小时记录｜主力资金流｜阈值提醒｜历史趋势")
@@ -32,7 +33,7 @@ with st.sidebar:
     st.caption("深南走势 25% · PCB板块 20% · 大资金流 20% · 美股科技 15% · 基本面代理 20%")
     st.markdown("**评分参考区间**")
     st.caption("0–39 偏弱｜40–59 观察｜60–69 初步改善｜70–79 偏强｜80–89 强势｜90–100 很强")
-    st.caption("GitHub Actions 每个工作日北京时间约09:05–15:05每小时运行一次；定时任务可能延迟。")
+    st.caption("GitHub Actions 每个工作日北京时间约09:05–15:05每小时运行一次；定时任务可能延迟。深南日线/小时线优先东方财富，备用新浪/腾讯；PCB优先东方财富PCB概念指数，备用PCB成分股等权代理。")
 
 hourly = pd.read_csv(HOURLY) if HOURLY.exists() else pd.DataFrame()
 daily = pd.read_csv(DATA) if DATA.exists() else pd.DataFrame()
@@ -69,7 +70,11 @@ else:
     c1.metric("最新综合评分", fmt_num(score, "/100"))
     c2.metric("评分状态", status)
     c3.metric("数据覆盖率", fmt_num(coverage, "%", 0))
-    st.caption(f"本次记录时间：{latest['更新时间']}｜行情时间：{latest.get('行情数据时间', '未知')}｜数据源：{latest.get('数据源', '未知')}")
+    st.caption(f"本次记录时间：{latest['更新时间']}｜深南行情时间：{latest.get('行情数据时间', '未知')}")
+    src1, src2 = st.columns(2)
+    src1.caption(f"深南电路数据源：{latest.get('深南数据源', '旧记录/未知')}")
+    src2.caption(f"PCB板块数据源：{latest.get('PCB数据源', '旧记录/未知')}｜数据日期：{latest.get('PCB数据日期', '未知')}")
+    st.caption(f"其他数据源：{latest.get('数据源', '未知')}")
 
     error_text = str(latest.get("数据异常", ""))
     if error_text and error_text.lower() != "nan":
@@ -126,12 +131,21 @@ if not daily.empty:
     st.download_button("下载全部日度历史 CSV", daily.to_csv(index=False).encode("utf-8-sig"), "深南电路日度历史.csv", "text/csv")
 
 st.divider()
-st.subheader("微信提醒配置")
-st.markdown(
-    "在 GitHub 仓库 **Settings → Secrets and variables → Actions → New repository secret** 中，"
-    "新增名称 `PUSHPLUS_TOKEN`，值填写你自己的 PushPlus Token。不要把 Token 写入代码或公开提交。"
-)
-st.caption("达到60/70/80/90分时按阈值首次触发推送；评分回落到60分以下后重新解锁下一轮提醒。未配置 Token 时网站照常评分，但不会发送微信提醒。")
+st.subheader("🔔 评分阈值提醒记录")
+st.caption("无需申请 Token，也无需配置 GitHub Secrets。综合评分首次达到60、70、80或90分时，会自动写入下面的提醒记录；评分回落到60分以下后，下一轮突破会重新记录。提醒显示在本网站内，不会主动发送微信消息。")
+if ALERT_HISTORY.exists():
+    try:
+        alerts = pd.read_csv(ALERT_HISTORY)
+        if not alerts.empty:
+            st.dataframe(alerts.tail(50).sort_values("触发时间", ascending=False), use_container_width=True, hide_index=True)
+            st.download_button("下载阈值提醒记录 CSV", alerts.to_csv(index=False).encode("utf-8-sig"), "深南电路阈值提醒.csv", "text/csv")
+        else:
+            st.info("目前还没有触发过阈值提醒。")
+    except Exception as exc:
+        st.warning(f"提醒记录暂时无法读取：{exc}")
+else:
+    st.info("目前还没有触发过阈值提醒。达到60/70/80/90分时，这里会自动留下记录。")
+
 st.subheader("基本面指标说明")
 st.markdown(
     "当前基本面项使用 `data/ai_signal.txt` 的人工信号作为代理：-2对应0分、0对应50分、+2对应100分。"
