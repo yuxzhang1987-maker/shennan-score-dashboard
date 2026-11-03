@@ -67,8 +67,15 @@ def parse_em_klines(secid: str, klt: int, beg: str, end: str, limit: int = 600) 
     rows = (payload.get("data") or {}).get("klines") or []
     if not rows:
         raise RuntimeError(f"东方财富K线返回空数据: {secid}, klt={klt}")
-    parsed = [str(x).split(",") for x in rows]
-    df = pd.DataFrame(parsed, columns=["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"][:len(parsed[0])])
+    parsed = []
+    for item in rows:
+        values = str(item).split(",")[:11]
+        values += [None] * (11 - len(values))
+        parsed.append(values)
+    df = pd.DataFrame.from_records(
+        parsed,
+        columns=["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额", "振幅", "涨跌幅", "涨跌额", "换手率"],
+    )
     df["时间"] = pd.to_datetime(df["时间"], errors="coerce")
     for col in ["开盘", "收盘", "最高", "最低", "成交量", "成交额"]:
         if col in df.columns:
@@ -101,10 +108,17 @@ def parse_tencent_kline(code: str, count: int = 600) -> pd.DataFrame:
     rows = item.get("qfqday") or item.get("day") or []
     if not rows:
         raise RuntimeError(f"腾讯K线返回空数据: {market_code}")
-    df = pd.DataFrame(rows)
-    # Tencent row format: date, open, close, high, low, volume, amount ...
-    df = df.iloc[:, :7].copy()
-    df.columns = ["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额"]
+    # Tencent rows can contain different optional trailing fields. Normalize each
+    # row to the seven fields used here to avoid Pandas mismatched-length warnings.
+    normalized_rows = []
+    for row in rows:
+        values = list(row)[:7]
+        values += [None] * (7 - len(values))
+        normalized_rows.append(values)
+    df = pd.DataFrame.from_records(
+        normalized_rows,
+        columns=["时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额"],
+    )
     df["时间"] = pd.to_datetime(df["时间"], errors="coerce")
     for col in ["开盘", "收盘", "最高", "最低", "成交量", "成交额"]:
         df[col] = as_num(df[col])
@@ -164,6 +178,9 @@ def get_stock_intraday():
                 # Keep bars from the recent period only.
                 df = df[df["时间"] >= pd.Timestamp(datetime.now() - timedelta(days=15))]
                 if not df.empty:
+                    latest_bar = pd.Timestamp(df["时间"].max())
+                    if (datetime.now() - latest_bar.to_pydatetime()).total_seconds() > 4 * 24 * 3600:
+                        raise RuntimeError(f"分钟线最新时间{latest_bar}已超过4天，拒绝作为当前小时行情")
                     df.attrs["source"] = name
                     return df
         except Exception as exc:
@@ -178,28 +195,51 @@ PCB_BASKET = ["002916", "002463", "002938", "300476", "603920", "688183", "00257
 
 
 def get_eastmoney_pcb_board():
-    # Resolve the current PCB concept-board code dynamically, then read its own K-line.
-    url = "https://push2.eastmoney.com/api/qt/clist/get"
-    params = {"pn": "1", "pz": "500", "po": "1", "np": "1", "fltt": "2", "invt": "2", "fid": "f3", "fs": "m:90+t:3", "fields": "f12,f14"}
-    payload = http_get(url, params).json()
-    diff = (payload.get("data") or {}).get("diff") or []
-    if isinstance(diff, dict):
-        diff = list(diff.values())
-    matches = [x for x in diff if "PCB" in str(x.get("f14", "")).upper()]
-    if not matches:
-        raise RuntimeError("东方财富概念板块列表中未找到PCB概念板块")
-    # Prefer the exact PCB概念 name where available.
-    matches.sort(key=lambda x: ("PCB概念" not in str(x.get("f14", "")), len(str(x.get("f14", "")))))
-    code = str(matches[0].get("f12", ""))
-    if not code:
-        raise RuntimeError("PCB概念板块代码为空")
+    """Fetch the official Eastmoney PCB concept-board K-line.
+
+    BK0877 is the PCB concept board shown on Eastmoney's PCB page. We try this
+    known code first, then dynamically resolve the board name as a fallback.
+    """
     beg = (datetime.now() - timedelta(days=600)).strftime("%Y%m%d")
     end = datetime.now().strftime("%Y%m%d")
-    df = parse_em_klines(f"90.{code}", 101, beg, end, 600)
-    s = df.set_index("时间")["收盘"]
-    s.index = s.index.normalize()
-    check_fresh(s, "PCB概念指数")
-    return s, f"东方财富PCB概念指数({code})"
+    candidates = [("BK0877", "东方财富PCB概念指数(BK0877)")]
+
+    # Dynamic discovery protects against board-code changes or renamed boards.
+    try:
+        url = "https://push2.eastmoney.com/api/qt/clist/get"
+        params = {
+            "pn": "1", "pz": "500", "po": "1", "np": "1", "fltt": "2",
+            "invt": "2", "fid": "f3", "fs": "m:90+t:3",
+            "fields": "f12,f14",
+        }
+        payload = http_get(url, params).json()
+        diff = (payload.get("data") or {}).get("diff") or []
+        if isinstance(diff, dict):
+            diff = list(diff.values())
+        matches = [x for x in diff if "PCB" in str(x.get("f14", "")).upper()]
+        matches.sort(key=lambda x: ("PCB概念" not in str(x.get("f14", "")), len(str(x.get("f14", "")))))
+        for item in matches:
+            code = str(item.get("f12", "")).strip()
+            name = str(item.get("f14", "PCB概念指数"))
+            if code and all(code != x[0] for x in candidates):
+                candidates.append((code, f"东方财富{name}({code})"))
+    except Exception as exc:
+        print(f"WARN PCB板块代码动态发现失败，将尝试已知代码BK0877: {exc}")
+
+    errors = []
+    for code, label in candidates:
+        try:
+            df = parse_em_klines(f"90.{code}", 101, beg, end, 600)
+            if df is None or df.empty:
+                raise RuntimeError("板块K线为空")
+            s = df.set_index("时间")["收盘"]
+            s.index = s.index.normalize()
+            s = s[~s.index.duplicated(keep="last")].dropna()
+            check_fresh(s, "PCB官方概念指数", max_age_days=10)
+            return s, label
+        except Exception as exc:
+            errors.append(f"{code}: {exc}")
+    raise RuntimeError("东方财富PCB官方指数接口失败；" + " | ".join(errors))
 
 
 def get_pcb_basket_proxy():
@@ -243,28 +283,20 @@ def get_pcb_basket_proxy():
 
 
 def get_pcb_daily():
+    """A strategy: official PCB index first, constituent proxy second.
+
+    Do not silently substitute the broad 元件 industry for a PCB index.
+    """
     errors = []
-    for name, fn in [("东方财富PCB概念指数", get_eastmoney_pcb_board), ("PCB成分股代理", get_pcb_basket_proxy)]:
+    for name, fn in [
+        ("东方财富PCB官方概念指数", get_eastmoney_pcb_board),
+        ("PCB成分股等权代理", get_pcb_basket_proxy),
+    ]:
         try:
             return fn()
         except Exception as exc:
             errors.append(f"{name}: {exc}")
-    # Last-resort proxy: 元件行业板块. Keep its identity explicit.
-    if ak is not None:
-        try:
-            start = (datetime.now() - timedelta(days=600)).strftime("%Y%m%d")
-            end = datetime.now().strftime("%Y%m%d")
-            df = ak.stock_board_industry_hist_em(symbol="元件", period="daily", start_date=start, end_date=end, adjust="")
-            if df is not None and not df.empty:
-                date_col = "日期" if "日期" in df.columns else df.columns[0]
-                df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
-                df["收盘"] = as_num(df["收盘"])
-                s = df.dropna(subset=[date_col, "收盘"]).set_index(date_col)["收盘"].sort_index()
-                check_fresh(s, "元件行业代理")
-                return s, "东方财富元件行业代理（非纯PCB）"
-        except Exception as exc:
-            errors.append(f"元件行业代理: {exc}")
-    raise RuntimeError("PCB数据源均不可用；" + " | ".join(errors))
+    raise RuntimeError("官方PCB指数和成分股代理均不可用；" + " | ".join(errors))
 
 
 def get_fund_flow():
@@ -474,6 +506,7 @@ def main():
     threshold_alert(total, stamp, details)
     print(f"Updated at {stamp}; score={total:.2f}; coverage={coverage:.0f}%")
     print("DATA_SOURCES:", " | ".join(sources))
+    print(f"DATA_DATES: 深南={market_data_time or '不可用'} | PCB={pcb_date or '不可用'} | 资金={flow_date or '不可用'} | 美股={us_date or '不可用'}")
     if errors:
         print("DATA_WARNINGS:", " | ".join(errors))
     if not scores or coverage < 80:
