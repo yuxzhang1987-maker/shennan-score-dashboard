@@ -363,6 +363,15 @@ def _score_gap(gap, lower=-8.0, upper=8.0):
     return clip((gap - lower) / (upper - lower) * 100)
 
 
+def trend_score(series):
+    """外部市场（纳斯达克100）趋势评分：20日收益与50日均线位置。"""
+    s = as_num(series).dropna().sort_index()
+    ret20 = s.pct_change(20) * 100
+    ma50 = s.rolling(50, min_periods=25).mean()
+    gap50 = (s / ma50 - 1) * 100
+    return 0.60 * _score_pct(ret20, -10, 10) + 0.40 * _score_gap(gap50, -5, 5)
+
+
 def recent_trend_score(series, volume=None):
     """近期走势：当日、3日、5日动量 + 成交量配合 + 5日均线位置。"""
     s = as_num(series).dropna().sort_index()
