@@ -4,7 +4,8 @@ import json
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import pandas as pd
@@ -24,8 +25,10 @@ ALERT_HISTORY_FILE = DATA_DIR / "alert_history.csv"
 AI_FILE = DATA_DIR / "ai_signal.txt"
 
 WEIGHTS = {
-    "深南走势评分": 0.25,
-    "PCB板块评分": 0.20,
+    "深南近期走势评分": 0.10,
+    "深南中期走势评分": 0.15,
+    "PCB近期走势评分": 0.08,
+    "PCB中期走势评分": 0.12,
     "大资金流评分": 0.20,
     "美股科技评分": 0.15,
     "基本面评分": 0.20,
@@ -154,8 +157,13 @@ def get_stock_daily():
             df["时间"] = pd.to_datetime(df["时间"], errors="coerce")
             df["收盘"] = as_num(df["收盘"])
             df = df.dropna(subset=["时间", "收盘"]).sort_values("时间")
-            s = df.set_index("时间")["收盘"]
+            indexed = df.set_index("时间")
+            s = indexed["收盘"].copy()
             s.index = s.index.normalize()
+            if "成交量" in indexed.columns:
+                vol = as_num(indexed["成交量"]).copy()
+                vol.index = pd.to_datetime(indexed.index).normalize()
+                s.attrs["volume"] = vol.groupby(level=0).last()
             check_fresh(s, "深南电路日线")
             return s, name
         except Exception as exc:
@@ -346,26 +354,70 @@ def get_us_tech():
     return s
 
 
-def trend_score(series):
-    series = as_num(series).dropna().sort_index()
-    ret20 = series.pct_change(20) * 100
-    ma50 = series.rolling(50, min_periods=25).mean()
-    gap = (series / ma50 - 1) * 100
-    return 0.6 * clip((ret20 + 10) / 20 * 100) + 0.4 * clip((gap + 5) / 10 * 100)
+def _score_pct(pct, lower=-10.0, upper=10.0):
+    """Map a percentage return to a bounded 0-100 score."""
+    return clip((pct - lower) / (upper - lower) * 100)
+
+
+def _score_gap(gap, lower=-8.0, upper=8.0):
+    return clip((gap - lower) / (upper - lower) * 100)
+
+
+def recent_trend_score(series, volume=None):
+    """近期走势：当日、3日、5日动量 + 成交量配合 + 5日均线位置。"""
+    s = as_num(series).dropna().sort_index()
+    r1 = s.pct_change(1) * 100
+    r3 = s.pct_change(3) * 100
+    r5 = s.pct_change(5) * 100
+    ma5 = s.rolling(5, min_periods=3).mean()
+    gap5 = (s / ma5 - 1) * 100
+    if volume is not None:
+        v = as_num(volume).reindex(s.index)
+        vratio = v / v.rolling(5, min_periods=3).mean()
+        # 0.5倍及以下视为量能偏弱，2倍及以上视为明显放量。
+        volume_score = clip((vratio - 0.5) / 1.5 * 100)
+        volume_score = volume_score.where(vratio.notna(), 50.0)
+    else:
+        volume_score = pd.Series(50.0, index=s.index)
+    return (0.25 * _score_pct(r1, -5, 5)
+            + 0.20 * _score_pct(r3, -8, 8)
+            + 0.20 * _score_pct(r5, -10, 10)
+            + 0.20 * volume_score
+            + 0.15 * _score_gap(gap5, -5, 5))
+
+
+def medium_trend_score(series):
+    """中期走势：20/60日收益、20/50日均线位置与均线方向。"""
+    s = as_num(series).dropna().sort_index()
+    r20 = s.pct_change(20) * 100
+    r60 = s.pct_change(60) * 100
+    ma20 = s.rolling(20, min_periods=10).mean()
+    ma50 = s.rolling(50, min_periods=25).mean()
+    gap20 = (s / ma20 - 1) * 100
+    gap50 = (s / ma50 - 1) * 100
+    ma_direction = (ma20 / ma20.shift(5) - 1) * 100
+    return (0.30 * _score_pct(r20, -20, 20)
+            + 0.20 * _score_pct(r60, -30, 30)
+            + 0.15 * _score_gap(gap20, -10, 10)
+            + 0.15 * _score_gap(gap50, -15, 15)
+            + 0.20 * _score_pct(ma_direction, -5, 5))
 
 
 def stock_score(daily, intraday):
+    """Return separate recent and medium scores for the stock."""
     s = daily.copy()
+    volume = s.attrs.get("volume")
     if intraday is not None and not intraday.empty:
         latest = intraday.iloc[-1]
-        s.loc[pd.Timestamp(latest["时间"]).normalize()] = float(latest["收盘"])
-        s = s.sort_index()
-    r20 = s.pct_change(20) * 100
-    r5 = s.pct_change(5) * 100
-    ma50 = s.rolling(50, min_periods=25).mean()
-    gap = (s / ma50 - 1) * 100
-    return 0.5 * clip((r20 + 10) / 20 * 100) + 0.3 * clip((gap + 5) / 10 * 100) + 0.2 * clip((r5 + 5) / 10 * 100)
-
+        day = pd.Timestamp(latest["时间"]).normalize()
+        s.loc[day] = float(latest["收盘"])
+        if "成交量" in intraday.columns and pd.notna(latest.get("成交量")):
+            if volume is None:
+                volume = pd.Series(dtype=float)
+            volume = volume.copy()
+            volume.loc[day] = float(latest["成交量"])
+    s = s.sort_index()
+    return recent_trend_score(s, volume), medium_trend_score(s)
 
 def read_fundamental_score():
     try:
@@ -421,7 +473,7 @@ def threshold_alert(score, stamp, details):
 
 def main():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now()
+    now = datetime.now(ZoneInfo("Asia/Shanghai"))
     stamp = now.strftime("%Y-%m-%d %H:%M:%S")
     errors, sources = [], []
     daily_stock = intraday = pcb = flow = us = None
@@ -455,8 +507,9 @@ def main():
 
     scores = {}
     if daily_stock is not None and len(daily_stock) >= 25:
-        ss = stock_score(daily_stock, intraday)
-        scores["深南走势评分"] = latest_value(ss)
+        stock_recent, stock_medium = stock_score(daily_stock, intraday)
+        scores["深南近期走势评分"] = latest_value(stock_recent)
+        scores["深南中期走势评分"] = latest_value(stock_medium)
         if intraday is not None and not intraday.empty:
             stock_price = float(intraday.iloc[-1]["收盘"])
             market_data_time = str(intraday.iloc[-1]["时间"])
@@ -466,7 +519,8 @@ def main():
     else:
         stock_price, market_data_time = float("nan"), ""
     if pcb is not None:
-        scores["PCB板块评分"] = latest_value(trend_score(pcb))
+        scores["PCB近期走势评分"] = latest_value(recent_trend_score(pcb))
+        scores["PCB中期走势评分"] = latest_value(medium_trend_score(pcb))
     if flow is not None:
         scores["大资金流评分"] = float(flow.iloc[-1]["大资金流评分"])
     if us is not None:
@@ -485,9 +539,9 @@ def main():
     us_date = str(us.index[-1].date()) if us is not None else ""
 
     row = {
-        "日期": now.strftime("%Y-%m-%d"), "更新时间": stamp, "行情数据时间": market_data_time,
-        "深南电路收盘": stock_price, "深南走势评分": scores.get("深南走势评分"), "深南数据源": stock_source,
-        "PCB板块评分": scores.get("PCB板块评分"), "PCB数据日期": pcb_date, "PCB数据源": pcb_source,
+        "日期": now.strftime("%Y-%m-%d"), "更新时间": stamp, "更新时间时区": "Asia/Shanghai", "行情数据时间": market_data_time,
+        "深南电路收盘": stock_price, "深南近期走势评分": scores.get("深南近期走势评分"), "深南中期走势评分": scores.get("深南中期走势评分"), "深南数据源": stock_source,
+        "PCB近期走势评分": scores.get("PCB近期走势评分"), "PCB中期走势评分": scores.get("PCB中期走势评分"), "PCB数据日期": pcb_date, "PCB数据源": pcb_source,
         "主力净流入（亿元）": flow_amt, "主力净流入占比（%）": flow_pct,
         "资金流数据日期": flow_date, "大资金流评分": scores.get("大资金流评分"),
         "美股科技评分": scores.get("美股科技评分"), "美股数据日期": us_date,
@@ -504,13 +558,14 @@ def main():
     merge_daily(old, row).to_csv(DAILY_FILE, index=False, encoding="utf-8-sig")
     details = "；".join(f"{k}：{v:.1f}" for k, v in scores.items() if pd.notna(v))
     threshold_alert(total, stamp, details)
-    print(f"Updated at {stamp}; score={total:.2f}; coverage={coverage:.0f}%")
+    print(f"Updated at {stamp} Asia/Shanghai; score={total:.2f}; coverage={coverage:.0f}%")
     print("DATA_SOURCES:", " | ".join(sources))
     print(f"DATA_DATES: 深南={market_data_time or '不可用'} | PCB={pcb_date or '不可用'} | 资金={flow_date or '不可用'} | 美股={us_date or '不可用'}")
     if errors:
         print("DATA_WARNINGS:", " | ".join(errors))
     if not scores or coverage < 80:
         print("WARNING 数据覆盖率低于80%，综合评分应谨慎参考。")
+    print("TREND_SCORES:", {k: round(float(v), 2) for k, v in scores.items() if "近期走势" in k or "中期走势" in k and pd.notna(v)})
 
 
 if __name__ == "__main__":

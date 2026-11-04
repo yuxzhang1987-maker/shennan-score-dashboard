@@ -12,7 +12,7 @@ HOURLY = BASE / "data" / "hourly_history.csv"
 ALERT_HISTORY = BASE / "data" / "alert_history.csv"
 
 st.title("📈 深南电路智能监控评分")
-st.caption("五维评分｜逐小时记录｜主力资金流｜阈值提醒｜历史趋势")
+st.caption("近期/中期双趋势评分｜逐小时记录｜主力资金流｜阈值提醒｜历史趋势")
 st.warning(
     "本工具是规则化市场环境监测，不代表上涨概率，也不是自动买卖指令。"
     "资金流是平台按成交单分类估算，不等于真实机构账户。数据源可能延迟或临时不可用。"
@@ -30,10 +30,10 @@ with st.sidebar:
             except Exception as exc:
                 st.error(f"更新失败：{exc}")
     st.markdown("**评分权重**")
-    st.caption("深南走势 25% · PCB板块 20% · 大资金流 20% · 美股科技 15% · 基本面代理 20%")
+    st.caption("深南近期10% + 中期15% · PCB近期8% + 中期12% · 大资金流20% · 美股科技15% · 基本面代理20%")
     st.markdown("**评分参考区间**")
     st.caption("0–39 偏弱｜40–59 观察｜60–69 初步改善｜70–79 偏强｜80–89 强势｜90–100 很强")
-    st.caption("GitHub Actions 每个工作日北京时间约09:05–15:05每小时运行一次；定时任务可能延迟。深南日线/小时线优先东方财富，备用新浪/腾讯；PCB优先东方财富PCB概念指数，备用PCB成分股等权代理。")
+    st.caption("GitHub Actions 每个工作日北京时间约09:05–15:05每小时运行一次；页面记录时间统一显示北京时间。深南日线/小时线优先东方财富，备用新浪/腾讯；PCB优先东方财富PCB概念指数，备用PCB成分股等权代理。")
 
 hourly = pd.read_csv(HOURLY) if HOURLY.exists() else pd.DataFrame()
 daily = pd.read_csv(DATA) if DATA.exists() else pd.DataFrame()
@@ -41,7 +41,12 @@ daily = pd.read_csv(DATA) if DATA.exists() else pd.DataFrame()
 if hourly.empty:
     st.info("尚无升级后的逐小时记录。请点击左侧“立即更新数据”，或等待 GitHub Actions 首次运行。原有日线历史数据不会被删除。")
 else:
+    # 旧版本时间戳由GitHub服务器按UTC写入；新版本明确写入北京时间。
     hourly["更新时间"] = pd.to_datetime(hourly["更新时间"], errors="coerce")
+    if "更新时间时区" not in hourly.columns:
+        hourly["更新时间时区"] = ""
+    legacy = hourly["更新时间时区"].fillna("").astype(str).eq("")
+    hourly.loc[legacy, "更新时间"] = hourly.loc[legacy, "更新时间"] + pd.Timedelta(hours=8)
     hourly = hourly.dropna(subset=["更新时间"]).sort_values("更新时间")
     latest = hourly.iloc[-1]
     score = pd.to_numeric(latest.get("综合评分_v2"), errors="coerce")
@@ -82,15 +87,21 @@ else:
     if pd.notna(coverage) and coverage < 80:
         st.error("本次有效指标权重覆盖率低于80%，请不要单独依据综合评分作决策。")
 
-    st.subheader("五项指标评分")
+    st.subheader("走势双评分")
+    st.caption("近期分数观察1—5个交易日的强弱；中期分数观察20—60个交易日的趋势。两者独立计算，避免单日涨停被中期弱势完全掩盖。")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("深南近期走势", fmt_num(latest.get("深南近期走势评分")), help="当日25%、近3日20%、近5日20%、量能20%、5日均线位置15%")
+    c2.metric("深南中期走势", fmt_num(latest.get("深南中期走势评分")), help="近20/60日收益、20/50日均线位置及均线方向")
+    c3.metric("PCB近期走势", fmt_num(latest.get("PCB近期走势评分")))
+    c4.metric("PCB中期走势", fmt_num(latest.get("PCB中期走势评分")))
+
+    st.subheader("其他三项指标评分")
     metrics = [
-        ("深南电路自身走势", "深南走势评分", "25%"),
-        ("PCB板块走势", "PCB板块评分", "20%"),
         ("大资金流向", "大资金流评分", "20%"),
         ("美股科技趋势（纳斯达克100）", "美股科技评分", "15%"),
-        ("基本面/AI资本开支人工代理", "基本面评分", "20%"),
+        ("基本面/人工代理", "基本面评分", "20%"),
     ]
-    cols = st.columns(5)
+    cols = st.columns(3)
     for i, (label, key, weight) in enumerate(metrics):
         cols[i].metric(label, fmt_num(latest.get(key)), help=f"权重 {weight}")
 
@@ -102,9 +113,11 @@ else:
     st.caption("正数表示该平台统计口径下净流入，负数表示净流出。不同平台的主力资金定义可能不同。")
 
     st.subheader("逐小时综合评分曲线")
-    chart = hourly[["更新时间", "综合评分_v2"]].copy().set_index("更新时间")
-    chart["综合评分_v2"] = pd.to_numeric(chart["综合评分_v2"], errors="coerce")
-    st.line_chart(chart, height=300)
+    chart_cols = [c for c in ["综合评分_v2", "深南近期走势评分", "深南中期走势评分", "PCB近期走势评分", "PCB中期走势评分"] if c in hourly.columns]
+    chart = hourly[["更新时间"] + chart_cols].copy().set_index("更新时间")
+    for col in chart_cols:
+        chart[col] = pd.to_numeric(chart[col], errors="coerce")
+    st.line_chart(chart, height=320)
 
     st.subheader("逐小时大资金流记录")
     flow_chart = hourly[["更新时间", "主力净流入（亿元）"]].copy().set_index("更新时间")
@@ -112,7 +125,7 @@ else:
     st.bar_chart(flow_chart, height=240)
 
     st.subheader("最近逐小时评分记录")
-    wanted = ["更新时间", "综合评分_v2", "数据覆盖率_v2", "深南走势评分", "PCB板块评分", "大资金流评分", "美股科技评分", "基本面评分", "主力净流入（亿元）", "主力净流入占比（%）", "数据异常"]
+    wanted = ["更新时间", "综合评分_v2", "数据覆盖率_v2", "深南近期走势评分", "深南中期走势评分", "PCB近期走势评分", "PCB中期走势评分", "大资金流评分", "美股科技评分", "基本面评分", "主力净流入（亿元）", "主力净流入占比（%）", "数据异常"]
     show = hourly[[c for c in wanted if c in hourly.columns]].tail(200).copy().sort_values("更新时间", ascending=False)
     for col in show.columns:
         if col not in ("更新时间", "数据异常"):
@@ -124,8 +137,10 @@ if not daily.empty:
     st.subheader("日度历史数据")
     if "综合评分_v2" in daily.columns:
         daily["日期"] = pd.to_datetime(daily["日期"], errors="coerce")
-        dchart = daily.dropna(subset=["日期"])[["日期", "综合评分_v2"]].copy().set_index("日期")
-        dchart["综合评分_v2"] = pd.to_numeric(dchart["综合评分_v2"], errors="coerce")
+        dcols = [c for c in ["综合评分_v2", "深南近期走势评分", "深南中期走势评分", "PCB近期走势评分", "PCB中期走势评分"] if c in daily.columns]
+        dchart = daily.dropna(subset=["日期"])[["日期"] + dcols].copy().set_index("日期")
+        for col in dcols:
+            dchart[col] = pd.to_numeric(dchart[col], errors="coerce")
         if not dchart.empty:
             st.line_chart(dchart, height=260)
     st.download_button("下载全部日度历史 CSV", daily.to_csv(index=False).encode("utf-8-sig"), "深南电路日度历史.csv", "text/csv")
@@ -145,6 +160,9 @@ if ALERT_HISTORY.exists():
         st.warning(f"提醒记录暂时无法读取：{exc}")
 else:
     st.info("目前还没有触发过阈值提醒。达到60/70/80/90分时，这里会自动留下记录。")
+
+st.subheader("走势双评分说明")
+st.markdown("近期走势侧重1—5个交易日，包含成交量配合；中期走势侧重20—60个交易日及均线方向。PCB的近期/中期分数基于当前可用PCB指数或成分股等权代理价格序列计算；当前版本尚未将涨停家数、上涨家数作为独立评分项。旧历史记录没有双评分字段时留空，不追溯伪造。")
 
 st.subheader("基本面指标说明")
 st.markdown(
