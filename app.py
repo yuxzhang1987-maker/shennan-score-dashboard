@@ -11,6 +11,11 @@ DATA = BASE / "data" / "history.csv"
 HOURLY = BASE / "data" / "hourly_history.csv"
 ALERT_HISTORY = BASE / "data" / "alert_history.csv"
 
+
+def fmt_num(value, suffix="", digits=1):
+    x = pd.to_numeric(value, errors="coerce")
+    return f"{x:.{digits}f}{suffix}" if pd.notna(x) else "暂无"
+
 st.title("📈 深南电路智能监控评分")
 st.caption("近期/中期双趋势评分｜逐小时记录｜主力资金流｜阈值提醒｜历史趋势")
 st.warning(
@@ -30,7 +35,7 @@ with st.sidebar:
             except Exception as exc:
                 st.error(f"更新失败：{exc}")
     st.markdown("**评分权重**")
-    st.caption("深南近期10% + 中期15% · PCB近期8% + 中期12% · 大资金流20% · 美股科技15% · 基本面代理20%")
+    st.caption("深南近期10% + 中期15% · PCB近期8% + 中期12% · 大资金流20% · 美股科技组合15% · 基本面代理20%")
     st.markdown("**评分参考区间**")
     st.caption("0–39 偏弱｜40–59 观察｜60–69 初步改善｜70–79 偏强｜80–89 强势｜90–100 很强")
     st.caption("GitHub Actions 每个工作日北京时间约09:05–15:05每小时运行一次；页面记录时间统一显示北京时间。深南日线/小时线优先东方财富，备用新浪/腾讯；PCB优先东方财富PCB概念指数，备用PCB成分股等权代理。")
@@ -51,10 +56,6 @@ else:
     latest = hourly.iloc[-1]
     score = pd.to_numeric(latest.get("综合评分_v2"), errors="coerce")
     coverage = pd.to_numeric(latest.get("数据覆盖率_v2"), errors="coerce")
-
-    def fmt_num(value, suffix="", digits=1):
-        x = pd.to_numeric(value, errors="coerce")
-        return f"{x:.{digits}f}{suffix}" if pd.notna(x) else "暂无"
 
     if pd.isna(score):
         status = "数据不足"
@@ -98,12 +99,29 @@ else:
     st.subheader("其他三项指标评分")
     metrics = [
         ("大资金流向", "大资金流评分", "20%"),
-        ("美股科技趋势（纳斯达克100）", "美股科技评分", "15%"),
+        ("美股科技趋势（SOX/纳指/龙头组合）", "美股科技评分", "15%"),
         ("基本面/人工代理", "基本面评分", "20%"),
     ]
     cols = st.columns(3)
     for i, (label, key, weight) in enumerate(metrics):
         cols[i].metric(label, fmt_num(latest.get(key)), help=f"权重 {weight}")
+
+    st.subheader("🇺🇸 美国半导体与科技环境评分")
+    st.caption("美股环境项总权重仍为原综合评分的15%，内部按 SOX 40%、纳指100 25%、英伟达15%、AMD 10%、博通10% 加权；缺失标的不以0分代替。")
+    us_cols = st.columns(5)
+    us_items = [
+        ("费城半导体 SOX", "SOX评分"),
+        ("纳斯达克100", "NDX评分"),
+        ("英伟达 NVDA", "NVDA评分"),
+        ("AMD", "AMD评分"),
+        ("博通 AVGO", "AVGO评分"),
+    ]
+    for i, (label, key) in enumerate(us_items):
+        us_cols[i].metric(label, fmt_num(latest.get(key)))
+    st.caption(
+        f"美股数据日期：{latest.get('美股数据日期', '未知')}｜"
+        f"美股组合数据覆盖率：{fmt_num(latest.get('美股数据覆盖率'), '%', 0)}"
+    )
 
     st.subheader("💰 深南电路主力资金流")
     f1, f2, f3 = st.columns(3)
@@ -169,3 +187,76 @@ st.markdown(
     "当前基本面项使用 `data/ai_signal.txt` 的人工信号作为代理：-2对应0分、0对应50分、+2对应100分。"
     "它不是自动读取财报得出的基本面评分。若没有人工输入，则按中性50分处理，并在记录中注明。"
 )
+
+
+
+st.divider()
+st.title("🧮 深南电路独立量化因子模型")
+st.caption("六因子独立评分与历史检验；不改变上方原综合评分及其权重。")
+st.warning(
+    "量化模型是研究参考，不是买卖指令或收益保证。基本面因子沿用人工信号；"
+    "没有录入时不计入有效覆盖率。未来收益只用于事后统计，不参与同日评分。"
+)
+
+try:
+    import quant_factor_model as qfm
+    qfile = qfm.HISTORY_FILE
+    qleft, qright = st.columns([1, 3])
+    with qleft:
+        if st.button("🔄 更新量化因子历史", type="primary", use_container_width=True):
+            with st.spinner("正在计算量化因子历史……"):
+                qfm.calculate_and_save()
+            st.success("量化因子历史已更新。")
+            st.rerun()
+    if qfile.exists():
+        qdf = pd.read_csv(qfile)
+        if not qdf.empty:
+            qdf["日期"] = pd.to_datetime(qdf["日期"], errors="coerce")
+            qdf = qdf.dropna(subset=["日期"]).sort_values("日期")
+            latest_q = qdf.iloc[-1]
+            a, b, c = st.columns(3)
+            a.metric("最新量化因子总分", fmt_num(latest_q.get("量化因子总分")))
+            b.metric("数据覆盖率", fmt_num(latest_q.get("数据覆盖率"), "%", 0))
+            c.metric("数据日期", latest_q["日期"].strftime("%Y-%m-%d"))
+            factor_rows = []
+            for factor, weight in qfm.WEIGHTS.items():
+                value = pd.to_numeric(latest_q.get(factor), errors="coerce")
+                factor_rows.append({
+                    "因子": factor,
+                    "得分": round(float(value), 1) if pd.notna(value) else "暂无",
+                    "权重": f"{weight:.0f}%",
+                })
+            st.subheader("六大因子得分")
+            st.dataframe(pd.DataFrame(factor_rows), use_container_width=True, hide_index=True)
+            st.subheader("量化因子历史曲线")
+            qchart = qdf[["日期", "历史可回测因子分"]].copy().set_index("日期")
+            qchart["历史可回测因子分"] = pd.to_numeric(qchart["历史可回测因子分"], errors="coerce")
+            st.line_chart(qchart, height=280)
+            st.caption("历史曲线基于前五项可逐日重建的市场因子；当前人工基本面只用于最新日，不倒灌到过去。")
+            st.subheader("不同分数区间的未来表现（事后统计）")
+            summary = qfm.backtest_summary(qdf)
+            if summary.empty:
+                st.info("成熟的未来5/20/60交易日样本暂时不足，随着数据积累会逐步形成。")
+            else:
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.caption(
+                f"当前记录 {len(qdf)} 个交易日。样本长度受数据接口限制；"
+                "样本数较少时统计结果不稳定，不能直接理解为未来上涨概率。"
+            )
+            display_cols = ["日期", "量化因子总分", "数据覆盖率"] + list(qfm.WEIGHTS)
+            st.subheader("最近量化因子记录")
+            st.dataframe(
+                qdf[[c for c in display_cols if c in qdf.columns]].tail(100).sort_values("日期", ascending=False),
+                use_container_width=True, hide_index=True
+            )
+            st.download_button(
+                "下载量化因子历史 CSV",
+                qdf.to_csv(index=False).encode("utf-8-sig"),
+                "深南电路量化因子历史.csv",
+                "text/csv",
+            )
+    else:
+        st.info("尚未生成量化因子历史。下一次自动更新会尝试创建；也可以点击左侧按钮生成。")
+except Exception as exc:
+    st.error(f"量化因子模块暂时不可用：{exc}")
+

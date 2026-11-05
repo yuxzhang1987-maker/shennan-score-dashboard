@@ -337,21 +337,80 @@ def safe_ak_call(fn, *args, **kwargs):
     raise last
 
 
+def _us_close_series(df, date_candidates=("date", "日期"), close_candidates=("close", "收盘")):
+    if df is None or df.empty:
+        raise RuntimeError("返回空数据")
+    work = df.copy()
+    if not any(c in work.columns for c in date_candidates):
+        if isinstance(work.index, pd.DatetimeIndex) or work.index.name in ("date", "日期", "时间"):
+            work = work.reset_index()
+            if work.columns[0] not in date_candidates:
+                work = work.rename(columns={work.columns[0]: "date"})
+        else:
+            raise RuntimeError(f"缺少日期字段，实际字段：{list(work.columns)}")
+    date_col = next((c for c in date_candidates if c in work.columns), None)
+    close_col = next((c for c in close_candidates if c in work.columns), None)
+    if close_col is None:
+        raise RuntimeError(f"缺少收盘价字段，实际字段：{list(df.columns)}")
+    out = work.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce").dt.normalize()
+    out[close_col] = as_num(out[close_col])
+    series = out.dropna(subset=[date_col, close_col]).sort_values(date_col).set_index(date_col)[close_col]
+    series = series[~series.index.duplicated(keep="last")]
+    if len(series) < 55:
+        raise RuntimeError(f"有效历史数据不足55个交易日（当前{len(series)}）")
+    return series.astype(float)
+
+
 def get_us_tech():
-    # Sina Finance is a China-facing data source; Nasdaq-100 is used as the US tech proxy.
+    """Return close-price series for SOX, NDX and three US semiconductor leaders.
+    Missing instruments are omitted; callers must expose coverage rather than fill zeros.
+    """
     if ak is None:
-        raise RuntimeError("美股指数接口需要AKShare，本次运行环境未安装")
-    df = safe_ak_call(ak.index_us_stock_sina, symbol=".NDX")
-    if df is None or df.empty or "close" not in df.columns:
-        raise RuntimeError("新浪财经未返回纳斯达克100指数")
-    df = df.copy()
-    date_col = "date" if "date" in df.columns else df.columns[0]
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
-    df["close"] = as_num(df["close"])
-    s = df.dropna(subset=[date_col, "close"]).sort_values(date_col).set_index(date_col)["close"]
-    if len(s) < 55:
-        raise RuntimeError("纳斯达克100历史数据不足55日")
-    return s
+        raise RuntimeError("美股行情接口需要AKShare；本次运行环境未安装")
+    instruments = {}
+    errors = []
+    # Try Eastmoney's China-facing US index history interface first, then Sina.
+    for key, symbol, sina_symbol in [("SOX", "SOX", ".SOX"), ("NDX", "NDX", ".NDX")]:
+        loaded = False
+        if hasattr(ak, "stock_us_index_daily_em"):
+            try:
+                df = safe_ak_call(ak.stock_us_index_daily_em, symbol=symbol)
+                instruments[key] = _us_close_series(df, ("date", "日期", "时间"), ("close", "收盘"))
+                loaded = True
+            except Exception as exc:
+                errors.append(f"{key}/东方财富: {exc}")
+        if not loaded:
+            try:
+                df = safe_ak_call(ak.index_us_stock_sina, symbol=sina_symbol)
+                instruments[key] = _us_close_series(df)
+            except Exception as exc:
+                errors.append(f"{key}/新浪: {exc}")
+    # US individual stocks: Sina historical daily interface.
+    for key, symbol in [("NVDA", "NVDA"), ("AMD", "AMD"), ("AVGO", "AVGO")]:
+        try:
+            df = safe_ak_call(ak.stock_us_daily, symbol=symbol, adjust="qfq")
+            instruments[key] = _us_close_series(df)
+        except Exception as exc:
+            errors.append(f"{key}: {exc}")
+    if not instruments:
+        raise RuntimeError("SOX/NDX/NVDA/AMD/AVGO全部不可用；" + " | ".join(errors))
+    return instruments, errors
+
+
+def us_tech_scores(instruments):
+    """Score each instrument on 20-day momentum and position vs 50-day average."""
+    weights = {"SOX": 0.40, "NDX": 0.25, "NVDA": 0.15, "AMD": 0.10, "AVGO": 0.10}
+    result = {}
+    for key, series in instruments.items():
+        result[key] = latest_value(trend_score(series))
+    available = [k for k in weights if k in result and pd.notna(result[k])]
+    weight_sum = sum(weights[k] for k in available)
+    composite = sum(result[k] * weights[k] for k in available) / weight_sum if weight_sum else float("nan")
+    coverage = weight_sum * 100
+    latest_dates = [instruments[k].dropna().index[-1] for k in instruments if k in instruments and not instruments[k].dropna().empty]
+    data_date = max(latest_dates).strftime("%Y-%m-%d") if latest_dates else ""
+    return result, composite, coverage, data_date
 
 
 def _score_pct(pct, lower=-10.0, upper=10.0):
@@ -485,7 +544,8 @@ def main():
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     stamp = now.strftime("%Y-%m-%d %H:%M:%S")
     errors, sources = [], []
-    daily_stock = intraday = pcb = flow = us = None
+    daily_stock = intraday = pcb = flow = None
+    us = {}
     stock_source = intraday_source = pcb_source = ""
 
     try:
@@ -510,8 +570,13 @@ def main():
     except Exception as exc:
         errors.append(f"资金流：{exc}")
     try:
-        us = get_us_tech(); sources.append("美股科技=新浪财经纳斯达克100")
+        us, us_errors = get_us_tech()
+        us_parts, us_composite, us_coverage, us_date = us_tech_scores(us)
+        sources.append(f"美股科技组合=SOX/NDX/NVDA/AMD/AVGO（覆盖{us_coverage:.0f}%）")
+        if us_errors:
+            errors.append("部分美股标的不可用：" + "；".join(us_errors))
     except Exception as exc:
+        us_parts, us_composite, us_coverage, us_date = {}, float("nan"), 0.0, ""
         errors.append(f"美股科技：{exc}")
 
     scores = {}
@@ -532,20 +597,24 @@ def main():
         scores["PCB中期走势评分"] = latest_value(medium_trend_score(pcb))
     if flow is not None:
         scores["大资金流评分"] = float(flow.iloc[-1]["大资金流评分"])
-    if us is not None:
-        scores["美股科技评分"] = latest_value(trend_score(us))
+    if pd.notna(us_composite):
+        scores["美股科技评分"] = us_composite
     fundamental, fundamental_note, fundamental_available = read_fundamental_score()
     scores["基本面评分"] = fundamental
 
+    effective_weights = WEIGHTS.copy()
+    # If only part of the five US instruments is available, only that fraction
+    # of the original 15% contributes to the total and coverage.
+    effective_weights["美股科技评分"] *= max(0.0, min(100.0, float(us_coverage))) / 100.0
     valid_keys = [k for k, v in scores.items() if pd.notna(v) and (k != "基本面评分" or fundamental_available)]
-    valid_weight = sum(WEIGHTS[k] for k in valid_keys)
-    total = sum(scores[k] * WEIGHTS[k] for k in valid_keys) / valid_weight if valid_weight else float("nan")
+    valid_weight = sum(effective_weights[k] for k in valid_keys)
+    total = sum(scores[k] * effective_weights[k] for k in valid_keys) / valid_weight if valid_weight else float("nan")
     coverage = valid_weight * 100
     flow_amt = float(flow.iloc[-1]["主力净流入（亿元）"]) if flow is not None else float("nan")
     flow_pct = float(flow.iloc[-1]["主力净流入占比（%）"]) if flow is not None else float("nan")
     flow_date = str(flow.index[-1].date()) if flow is not None else ""
     pcb_date = str(pcb.index[-1].date()) if pcb is not None else ""
-    us_date = str(us.index[-1].date()) if us is not None else ""
+    # us_date is supplied by the latest successfully retrieved US instrument.
 
     row = {
         "日期": now.strftime("%Y-%m-%d"), "更新时间": stamp, "更新时间时区": "Asia/Shanghai", "行情数据时间": market_data_time,
@@ -554,6 +623,9 @@ def main():
         "主力净流入（亿元）": flow_amt, "主力净流入占比（%）": flow_pct,
         "资金流数据日期": flow_date, "大资金流评分": scores.get("大资金流评分"),
         "美股科技评分": scores.get("美股科技评分"), "美股数据日期": us_date,
+        "SOX评分": us_parts.get("SOX"), "NDX评分": us_parts.get("NDX"),
+        "NVDA评分": us_parts.get("NVDA"), "AMD评分": us_parts.get("AMD"),
+        "AVGO评分": us_parts.get("AVGO"), "美股数据覆盖率": us_coverage,
         "基本面评分": scores.get("基本面评分"), "基本面说明": fundamental_note,
         "综合评分_v2": total, "数据覆盖率_v2": coverage,
         "数据源": "；".join(sources), "数据异常": "；".join(errors),
@@ -567,6 +639,13 @@ def main():
     merge_daily(old, row).to_csv(DAILY_FILE, index=False, encoding="utf-8-sig")
     details = "；".join(f"{k}：{v:.1f}" for k, v in scores.items() if pd.notna(v))
     threshold_alert(total, stamp, details)
+    # Maintain the independent quantitative-factor history automatically.
+    try:
+        import quant_factor_model
+        qframe = quant_factor_model.calculate_and_save()
+        print(f"QUANT_FACTOR: updated {len(qframe)} daily rows")
+    except Exception as exc:
+        print(f"QUANT_FACTOR_WARNING: {exc}")
     print(f"Updated at {stamp} Asia/Shanghai; score={total:.2f}; coverage={coverage:.0f}%")
     print("DATA_SOURCES:", " | ".join(sources))
     print(f"DATA_DATES: 深南={market_data_time or '不可用'} | PCB={pcb_date or '不可用'} | 资金={flow_date or '不可用'} | 美股={us_date or '不可用'}")
