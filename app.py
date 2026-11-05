@@ -260,3 +260,84 @@ try:
 except Exception as exc:
     st.error(f"量化因子模块暂时不可用：{exc}")
 
+
+# ==================== 独立智能做T模块 ====================
+st.divider()
+st.title("🎯 深南电路智能做T系统")
+st.caption("混合策略：震荡高抛低吸 + 趋势跟随｜稳健过滤｜T+1约束｜独立于长期底仓")
+st.warning("本模块为研究与模拟辅助，不会自动下单。A股实行T+1：当天新买入的股份不能当天卖出；卖出信号只能针对已有可卖底仓。行情和回测样本不足时，系统会明确提示，不输出虚假的胜率。")
+
+try:
+    import intraday_t_model as tmodel
+    tcol1, tcol2, tcol3 = st.columns([1, 1, 2])
+    with tcol1:
+        t_capital = st.number_input("做T机动资金（元）", min_value=10000, max_value=100000, value=50000, step=5000)
+    with tcol2:
+        t_cost_bps = st.number_input("双边费用+滑点假设（基点）", min_value=10, max_value=100, value=25, step=5)
+    with tcol3:
+        sellable_shares = st.number_input("当前可卖底仓股数（股）", min_value=0, max_value=1000000, value=0, step=100)
+    if st.button("📥 更新5分钟行情并计算做T信号", type="primary", use_container_width=True):
+        with st.spinner("正在获取深南电路5分钟K线、更新历史样本并计算信号……"):
+            try:
+                scored_t, signal_t, bt_t, source_t = tmodel.run_update()
+                st.success(f"行情更新完成：{source_t}；共{len(scored_t)}根5分钟K线")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"做T行情更新失败：{exc}")
+    if tmodel.BARS_FILE.exists():
+        bars_t = pd.read_csv(tmodel.BARS_FILE)
+        scored_t = tmodel.calculate(bars_t)
+        signal_t = tmodel.current_signal(scored_t)
+        bt_t = tmodel.backtest_next_session(scored_t, cost_bps=float(t_cost_bps))
+        bt_sell_t = tmodel.backtest_sell_first_same_day(scored_t, target_pct=0.45, cost_bps=float(t_cost_bps))
+        a,b,c,d = st.columns(4)
+        a.metric("当前模型状态", signal_t.get("action","数据不足"))
+        b.metric("最新行情价", fmt_num(signal_t.get("price"),"元",2))
+        c.metric("RSI(14)", fmt_num(signal_t.get("rsi"),"",1))
+        d.metric("趋势识别", signal_t.get("trend","未知"))
+        st.caption(f"行情时间：{signal_t.get('time','未知')}｜策略：{signal_t.get('strategy','-')}｜VWAP：{fmt_num(signal_t.get('vwap'),'元',2)}｜ATR：{fmt_num(signal_t.get('atr'),'元',2)}")
+        st.info(signal_t.get("reason","当前无有效信号"))
+        if signal_t.get("action")=="关注卖出" and sellable_shares<=0:
+            st.warning("你尚未填写可卖底仓股数。卖出信号仅作观察，不据此执行先卖后买。")
+        if signal_t.get("price") and signal_t.get("atr"):
+            px=float(signal_t["price"]); atr=float(signal_t["atr"])
+            buy_low=max(0,px-0.8*atr); buy_high=max(0,px-0.3*atr)
+            sell_low=px+0.3*atr; sell_high=px+0.8*atr
+            p1,p2,p3=st.columns(3)
+            p1.metric("ATR波动参考买入观察区",f"{buy_low:.2f}–{buy_high:.2f}元")
+            p2.metric("ATR波动参考卖出观察区",f"{sell_low:.2f}–{sell_high:.2f}元")
+            one_trade_cash=min(float(t_capital)*0.25,25000.0)
+            one_trade_lots=int(one_trade_cash/px/100)*100 if px>0 else 0
+            p3.metric("单次计划资金上限",f"{one_trade_cash:,.0f}元",help=f"按当前价约{one_trade_lots}股，按100股整数手估算；不是下单指令")
+            st.caption("以上只是ATR波动观察区，不是已验证的买卖价位；必须同时满足策略信号、成本覆盖和T+1可卖数量约束。")
+        st.subheader("历史信号检验：先卖后买回（同日T差价测试）")
+        z1,z2,z3,z4 = st.columns(4)
+        z1.metric("卖出信号数",str(bt_sell_t.get("signals",0)))
+        z2.metric("完成回补次数",str(bt_sell_t.get("completed",0)))
+        z3.metric("回补完成率",fmt_num(bt_sell_t.get("completion_rate"),"%",1))
+        z4.metric("平均净差价",fmt_num(bt_sell_t.get("avg_net_spread"),"%",2))
+        st.caption(bt_sell_t.get("note","暂无同日回补测试结果"))
+        st.caption("该测试假设你有可卖的原有底仓，卖出后同日回落挂单买回；未回补样本的机会成本尚未计入，不能单独视为完整策略收益。")
+        st.subheader("历史信号检验（T+1方向性测试）")
+        x1,x2,x3,x4 = st.columns(4)
+        x1.metric("有效样本数",str(bt_t.get("samples",0)))
+        x2.metric("历史胜率",fmt_num(bt_t.get("win_rate"),"%",1))
+        x3.metric("平均收益",fmt_num(bt_t.get("avg_return"),"%",2))
+        x4.metric("盈利因子",fmt_num(bt_t.get("profit_factor"),"",2))
+        st.caption(bt_t.get("note","暂无回测说明"))
+        if bt_t.get("samples",0)<100:
+            st.warning("目前有效样本不足100次，胜率和收益统计暂不具备稳定参考价值。系统不会把当前统计包装成已达到60%的准确率。建议继续积累历史5分钟数据，并进行滚动样本外验证。")
+        elif bt_t.get("win_rate") is not None and bt_t["win_rate"]<60:
+            st.warning("当前样本外/历史统计胜率尚未达到60%目标，不建议据此投入实盘资金。")
+        else:
+            st.success("当前统计达到初步观察门槛，但仍需检查样本外表现、盈亏比、最大回撤和实际成交成本。")
+        st.subheader("最近5分钟行情与策略信号")
+        cols_t=[c for c in ["时间","收盘","EMA9","EMA21","RSI14","日内VWAP","量比","趋势状态","策略类型","买入信号","卖出信号"] if c in scored_t.columns]
+        st.dataframe(scored_t[cols_t].tail(100).sort_values("时间",ascending=False),use_container_width=True,hide_index=True)
+        st.download_button("下载做T五分钟行情历史",bars_t.to_csv(index=False).encode("utf-8-sig"),"深南电路做T_5分钟行情.csv","text/csv")
+    else:
+        st.info("尚无独立5分钟行情历史。点击上方按钮首次获取；若数据源暂时不可用，原有综合评分系统不受影响。")
+    st.subheader("交易纪律")
+    st.markdown("- 稳健过滤：没有信号就观望，不设每日交易任务。\n- 单次计划资金建议先限制在机动资金的20%–30%，不一次性用满5–10万元。\n- 卖出信号只针对已有可卖底仓；新买入的股票遵守T+1，不能当日卖出。\n- 买卖价差必须覆盖佣金、印花税（卖出端）和滑点；未覆盖成本不做。\n- 先模拟交易至少20–30个交易日，再考虑小额实盘。")
+except Exception as exc:
+    st.error(f"智能做T模块暂时不可用：{exc}")
