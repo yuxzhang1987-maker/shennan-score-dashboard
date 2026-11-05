@@ -1,43 +1,32 @@
-name: Daily Shennan Score Update
-
+name: Hourly Shennan Score Update
 on:
   workflow_dispatch:
   schedule:
-    # 每个工作日北京时间 09:05、10:05、11:05、12:05、13:05、14:05、15:05
-    # GitHub Actions 使用 UTC；北京时间 = UTC + 8
+    # 每小时运行；覆盖A股交易时段并在非交易时段更新可获得的海外数据。
+    # UTC 01:05-07:05 = 北京时间09:05-15:05，周一至周五。
     - cron: "5 1-7 * * 1-5"
-
 permissions:
   contents: write
-
-concurrency:
-  group: shennan-score-update
-  cancel-in-progress: false
-
 jobs:
   update-score:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
-
       - run: pip install -r requirements.txt
-
-      - name: Update daily and hourly scores
+      - name: Update scores and send threshold alerts
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           TZ: Asia/Shanghai
         run: python update_data.py
-
-      - name: Commit history
+      - name: Commit history and alert state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A data/
-          git diff --cached --quiet || git commit -m "Update Shennan hourly score"
+          git add data/history.csv data/hourly_history.csv data/alert_state.json
+          git diff --cached --quiet || git commit -m "Update hourly Shennan score"
           git push
