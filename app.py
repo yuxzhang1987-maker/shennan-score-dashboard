@@ -286,6 +286,19 @@ try:
                 st.error(f"做T行情更新失败：{exc}")
     if tmodel.BARS_FILE.exists():
         bars_t = pd.read_csv(tmodel.BARS_FILE)
+        if not bars_t.empty and "时间" in bars_t.columns:
+            t_dates = pd.to_datetime(bars_t["时间"], errors="coerce").dt.date
+            t_valid_dates = t_dates.dropna().nunique()
+            t_first = pd.to_datetime(bars_t["时间"], errors="coerce").min()
+            t_last = pd.to_datetime(bars_t["时间"], errors="coerce").max()
+            st.caption(
+                f"历史积累：{len(bars_t):,} 根5分钟K线｜覆盖 {t_valid_dates} 个交易日｜"
+                f"起止：{t_first} 至 {t_last}"
+            )
+            if t_valid_dates < 20:
+                st.warning("5分钟历史样本仍不足20个交易日。GitHub Actions 已启用自动积累，请继续运行并等待数据增长；当前回测暂不具备稳定统计意义。")
+            elif t_valid_dates < 60:
+                st.info("已开始形成历史样本，建议积累至至少60个交易日后再评估策略。")
         scored_t = tmodel.calculate(bars_t)
         signal_t = tmodel.current_signal(scored_t)
         bt_t = tmodel.backtest_next_session(scored_t, cost_bps=float(t_cost_bps))
